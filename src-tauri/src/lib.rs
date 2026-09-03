@@ -12,6 +12,9 @@ use audio::{AudioEngine, AudioProcessor, AudioSink, OutputRouting};
 /// Shared application state holding the audio engine behind a mutex.
 struct AppState {
     audio_engine: Arc<Mutex<AudioEngine>>,
+    /// Shared FFT buffer for the visualizer. This avoids waiting on the heavyweight
+    /// audio-engine mutex while the real-time DSP thread processes a buffer.
+    fft_data: Arc<Mutex<Vec<f32>>>,
     /// Lets `set_output_device` retarget the running playback stream.
     routing: OutputRouting,
 }
@@ -110,8 +113,10 @@ fn set_power(state: State<AppState>, enabled: bool) -> Result<(), String> {
 
 /// Return the list of available audio output devices by querying PulseAudio.
 #[tauri::command]
-fn get_audio_devices() -> Result<Vec<AudioSink>, String> {
-    audio::get_pulse_sinks().map_err(|e| format!("Failed to get audio devices: {}", e))
+async fn get_audio_devices() -> Result<Vec<AudioSink>, String> {
+    tauri::async_runtime::spawn_blocking(audio::get_pulse_sinks)
+        .await
+        .map_err(|e| format!("Audio device query task failed: {}", e))?
 }
 
 /// Route processed audio to a specific sink, or to the system default when
@@ -127,8 +132,11 @@ fn set_output_device(state: State<AppState>, sink: Option<String>) -> Result<(),
 /// Return the current FFT magnitude data for the visualizer (32 bins).
 #[tauri::command]
 fn get_visualizer_data(state: State<AppState>) -> Result<Vec<f32>, String> {
-    let engine = state.audio_engine.lock().unwrap_or_else(|e| e.into_inner());
-    Ok(engine.get_fft_data())
+    Ok(state
+        .fft_data
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone())
 }
 
 // ── App Initialization ──
@@ -185,8 +193,11 @@ pub fn run() {
                 )?;
             }
 
-            // Create the shared audio engine
-            let audio_engine = Arc::new(Mutex::new(AudioEngine::new()));
+            // Create the shared audio engine and expose its FFT buffer separately
+            // so UI reads never contend with the real-time DSP mutex.
+            let engine = AudioEngine::new();
+            let fft_data = Arc::clone(&engine.fft_data);
+            let audio_engine = Arc::new(Mutex::new(engine));
             let routing = OutputRouting::default();
 
             // Start the PulseAudio capture → process → playback loop
@@ -200,6 +211,7 @@ pub fn run() {
             // Store state so Tauri commands can access the engine
             app.manage(AppState {
                 audio_engine,
+                fft_data,
                 routing,
             });
 

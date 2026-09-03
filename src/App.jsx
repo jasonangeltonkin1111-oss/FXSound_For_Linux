@@ -53,9 +53,11 @@ export default function App() {
       .then((detected) => {
         if (Array.isArray(detected) && detected.length > 0) {
           setDevices(detected);
-          // Open on the sink audio is actually playing through.
+          // Route FXSound output to the real physical sink. The virtual sink is
+          // the capture stage when system-wide FXSound routing is enabled.
           const active = detected.find((d) => d.is_default) ?? detected[0];
           setDevice(active.name);
+          call("set_output_device", { sink: active.name }).catch(console.error);
         }
       })
       .catch((err) => {

@@ -493,10 +493,7 @@ impl AudioEngine {
 
         // Periodic Hann window, matching the FFT's implicit periodicity.
         let fft_window = (0..FFT_SIZE)
-            .map(|n| {
-                0.5 * (1.0
-                    - (2.0 * std::f32::consts::PI * n as f32 / FFT_SIZE as f32).cos())
-            })
+            .map(|n| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * n as f32 / FFT_SIZE as f32).cos()))
             .collect();
 
         let sample_rate = SAMPLE_RATE as f32;
@@ -925,6 +922,42 @@ impl AudioProcessor {
         .map_err(|e| format!("Failed to create output stream: {}", e))
     }
 
+    /// Resolve a safe physical output when the virtual FXSound sink is the
+    /// server default. This avoids opening FXSound's playback stream on its own
+    /// capture stage during startup, which otherwise creates a feedback loop.
+    fn physical_output_sink() -> Option<String> {
+        let default = std::process::Command::new("pactl")
+            .arg("get-default-sink")
+            .output()
+            .ok()
+            .and_then(|out| {
+                if !out.status.success() {
+                    return None;
+                }
+                let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                (!name.is_empty()).then_some(name)
+            });
+
+        if let Some(name) = default.filter(|name| name != "fxsound_virtual") {
+            return Some(name);
+        }
+
+        std::process::Command::new("pactl")
+            .args(["list", "short", "sinks"])
+            .output()
+            .ok()
+            .and_then(|out| {
+                if !out.status.success() {
+                    return None;
+                }
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter_map(|line| line.split_whitespace().nth(1))
+                    .find(|name| *name != "fxsound_virtual")
+                    .map(str::to_owned)
+            })
+    }
+
     /// Main audio capture → process → playback loop.
     ///
     /// Reads from the system monitor source (captures all desktop audio),
@@ -970,9 +1003,11 @@ impl AudioProcessor {
             }
         };
 
-        // Create the playback output stream on whichever sink is selected.
+        // Create the playback output stream on the selected physical sink.
+        // When no explicit sink exists, never fall back to fxsound_virtual.
         let mut output_generation = routing.generation();
-        let mut output = Self::open_output(&spec, routing.sink().as_deref())?;
+        let initial_sink = routing.sink().or_else(Self::physical_output_sink);
+        let mut output = Self::open_output(&spec, initial_sink.as_deref())?;
 
         log::info!("Audio streams created successfully");
         log::info!("Processing system audio through FXSound...");
@@ -991,12 +1026,13 @@ impl AudioProcessor {
             if generation != output_generation {
                 output_generation = generation;
                 let requested = routing.sink();
-                match Self::open_output(&spec, requested.as_deref()) {
+                let target = requested.clone().or_else(Self::physical_output_sink);
+                match Self::open_output(&spec, target.as_deref()) {
                     Ok(stream) => {
                         output = stream;
                         log::info!(
                             "Output device switched to {}",
-                            requested.as_deref().unwrap_or("system default")
+                            target.as_deref().unwrap_or("system default")
                         );
                     }
                     Err(e) => log::error!("Keeping previous output device: {}", e),
@@ -1144,7 +1180,10 @@ pub fn get_pulse_sinks() -> Result<Vec<AudioSink>, String> {
         wait_for(&server_done);
         mainloop.lock();
     }
-    let default_sink = default_sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let default_sink = default_sink
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
 
     // ── Enumerate the sinks ──
     let sinks: Arc<Mutex<Vec<AudioSink>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1186,7 +1225,21 @@ pub fn get_pulse_sinks() -> Result<Vec<AudioSink>, String> {
 
     let mut devices = sinks.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
-    // Show the active device first so the dropdown opens on the right one.
+    // The virtual FXSound sink is the capture stage for system-wide routing,
+    // not a user-selectable physical output. When it is the server default,
+    // promote the first real sink so the GUI can route processed audio there.
+    let virtual_default = default_sink.as_deref() == Some("fxsound_virtual");
+    devices.retain(|sink| sink.name != "fxsound_virtual");
+    if virtual_default {
+        for sink in &mut devices {
+            sink.is_default = false;
+        }
+        if let Some(physical) = devices.first_mut() {
+            physical.is_default = true;
+        }
+    }
+
+    // Show the active physical device first so the dropdown opens on the right one.
     devices.sort_by_key(|sink| !sink.is_default);
 
     Ok(devices)
@@ -1492,6 +1545,42 @@ mod tests {
     }
 
     #[test]
+    fn test_fft_buffer_is_independent_of_engine_lock() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let engine = Arc::new(Mutex::new(AudioEngine::new()));
+        let fft_data = {
+            let guard = engine.lock().unwrap();
+            Arc::clone(&guard.fft_data)
+        };
+
+        // Simulate the real-time thread holding the heavyweight engine mutex.
+        let guard = engine.lock().unwrap();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_reader = Arc::clone(&completed);
+        let reader = thread::spawn(move || {
+            let data = fft_data.lock().unwrap();
+            assert_eq!(data.len(), 32);
+            completed_reader.store(true, Ordering::Release);
+        });
+
+        let start = Instant::now();
+        while !completed.load(Ordering::Acquire) && start.elapsed() < Duration::from_millis(100) {
+            thread::yield_now();
+        }
+
+        assert!(completed.load(Ordering::Acquire));
+        assert!(start.elapsed() < Duration::from_millis(100));
+        reader.join().unwrap();
+        drop(guard);
+    }
+
+    #[test]
     fn test_visualizer_decays_when_audio_stops() {
         // The FFT is only refreshed on the active path, so the silent and
         // powered-off paths must fade the bars instead of latching them.
@@ -1535,9 +1624,8 @@ mod tests {
             // Broadband, slightly decorrelated so surround and the reverb engage.
             let t = i as f32;
             frame[0] = 0.22 * (t * 0.01).sin() + 0.18 * (t * 0.21).sin() + 0.12 * (t * 0.93).sin();
-            frame[1] = 0.22 * (t * 0.01 + 0.5).sin()
-                + 0.18 * (t * 0.19).sin()
-                + 0.12 * (t * 0.87).sin();
+            frame[1] =
+                0.22 * (t * 0.01 + 0.5).sin() + 0.18 * (t * 0.19).sin() + 0.12 * (t * 0.87).sin();
         }
 
         for (index, name) in PRESET_NAMES.iter().enumerate() {

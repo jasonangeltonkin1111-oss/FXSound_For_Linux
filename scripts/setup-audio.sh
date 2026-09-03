@@ -22,26 +22,45 @@ echo ""
 echo "Setting up audio routing for FXSound..."
 echo ""
 
-# Get the default sink (output device)
+# Keep the real hardware sink as FXSound's physical output.
+# The FXSound virtual sink is the capture stage, so we must never create a
+# monitor -> virtual loopback or the app will capture its own processed audio.
+FXSOUND_SINK="fxsound_virtual"
 DEFAULT_SINK=$(pactl get-default-sink)
-echo "Default audio output: $DEFAULT_SINK"
+if [ "$DEFAULT_SINK" = "$FXSOUND_SINK" ]; then
+    DEFAULT_SINK=$(pactl list short sinks | awk -v v="$FXSOUND_SINK" '$2 != v {print $2; exit}')
+fi
+if [ -z "$DEFAULT_SINK" ]; then
+    echo "✗ Could not find a physical output sink"
+    exit 1
+fi
+echo "Physical audio output: $DEFAULT_SINK"
 
-# Create a null sink for FXSound
-echo "Creating FXSound virtual sink..."
-pactl load-module module-null-sink sink_name=fxsound_sink sink_properties=device.description="FXSound"
+# Create the virtual capture sink only when it does not already exist.
+FXSOUND_MODULE_ID=$(pactl list short modules | awk -v s="$FXSOUND_SINK" '$2 == "module-null-sink" && $3 ~ ("sink_name=" s) {print $1; exit}')
+if [ -z "$FXSOUND_MODULE_ID" ]; then
+    echo "Creating FXSound virtual sink..."
+    FXSOUND_MODULE_ID=$(pactl load-module module-null-sink sink_name="$FXSOUND_SINK" sink_properties=device.description="FXSound-Virtual")
+fi
 
-# Create loopback from default sink monitor to FXSound sink
-echo "Creating audio loopback..."
-pactl load-module module-loopback source="$DEFAULT_SINK.monitor" sink=fxsound_sink latency_msec=1
+# New applications send audio to the virtual sink; FXSound captures its monitor
+# and sends the processed result to the physical sink above.
+echo "Setting FXSound virtual sink as default..."
+pactl set-default-sink "$FXSOUND_SINK"
 
-# Set FXSound sink as default
-echo "Setting FXSound as default output..."
-pactl set-default-sink fxsound_sink
+# Move already-running playback streams into the virtual capture stage.
+FXSOUND_SINK_ID=$(pactl list short sinks | awk -v s="$FXSOUND_SINK" '$2 == s {print $1; exit}')
+while read -r INPUT_ID SINK_ID _; do
+    [ -z "$INPUT_ID" ] && continue
+    if [ "$SINK_ID" != "$FXSOUND_SINK_ID" ]; then
+        pactl move-sink-input "$INPUT_ID" "$FXSOUND_SINK" 2>/dev/null || true
+    fi
+done < <(pactl list short sink-inputs)
 
 echo ""
-echo "✓ Audio setup complete!"
+echo "✓ Audio routing ready: applications → FXSound → physical output"
 echo ""
-echo "Now run FXSound app. To restore original audio:"
+echo "Now run FXSound app. To restore the physical output:"
 echo "  pactl set-default-sink $DEFAULT_SINK"
-echo "  pactl unload-module module-null-sink"
-echo "  pactl unload-module module-loopback"
+echo "  # Remove the FXSound virtual sink when no longer needed:"
+echo "  pactl unload-module $FXSOUND_MODULE_ID"
