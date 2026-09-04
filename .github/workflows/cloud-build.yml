@@ -38,7 +38,7 @@ jobs:
 
       - name: Rust tests
         timeout-minutes: 10
-        run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets --locked
+        run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets --locked -- --test-threads=1
 
       - name: Build Tauri packages
         timeout-minutes: 20
