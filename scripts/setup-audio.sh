@@ -47,6 +47,8 @@ fi
 # and sends the processed result to the physical sink above.
 echo "Setting FXSound virtual sink as default..."
 pactl set-default-sink "$FXSOUND_SINK"
+# The virtual sink is the ingress for media players, so keep it unmuted.
+pactl set-sink-mute "$FXSOUND_SINK" 0 2>/dev/null || true
 
 # Move already-running playback streams into the virtual capture stage.
 FXSOUND_SINK_ID=$(pactl list short sinks | awk -v s="$FXSOUND_SINK" '$2 == s {print $1; exit}')

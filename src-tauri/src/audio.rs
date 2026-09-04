@@ -463,6 +463,10 @@ pub struct AudioEngine {
     /// Hann window applied before the visualizer FFT to suppress the spectral
     /// leakage that made neighbouring bars bleed into each other.
     fft_window: Vec<f32>,
+
+    /// Visualizer FFT cadence divider. Audio processing stays continuous while
+    /// spectrum calculation runs at a lower rate to save CPU on low-end systems.
+    fft_tick: u8,
 }
 
 impl AudioEngine {
@@ -516,6 +520,9 @@ impl AudioEngine {
             compressor: Compressor::new(sample_rate),
             limiter: Limiter::new(sample_rate),
             fft_window,
+            // Start ready so the first processed buffer immediately feeds the
+            // visualizer, then update every fourth buffer thereafter.
+            fft_tick: 3,
         }
     }
 
@@ -613,8 +620,13 @@ impl AudioEngine {
         // Hard limiter — prevent clipping
         self.apply_limiter(output);
 
-        // Update FFT data for the visualizer
-        self.update_fft(output);
+        // Update FFT data for the visualizer less frequently than the audio
+        // block rate. This reduces CPU/IPC pressure without affecting audio.
+        self.fft_tick = self.fft_tick.wrapping_add(1);
+        if self.fft_tick >= 4 {
+            self.fft_tick = 0;
+            self.update_fft(output);
+        }
     }
 
     // ── EQ Processing ──
@@ -635,6 +647,11 @@ impl AudioEngine {
                 active_bands[active_count] = band;
                 active_count += 1;
             }
+        }
+
+        if active_count == 0 {
+            output.copy_from_slice(input);
+            return;
         }
 
         let active_bands_slice = &active_bands[..active_count];
@@ -781,6 +798,9 @@ impl AudioEngine {
                 *value = 0.0;
             }
         }
+        // The next real audio block should repopulate the visualizer immediately
+        // after a fully decayed/silent state.
+        self.fft_tick = 3;
     }
 
     /// Compute FFT magnitudes from the output buffer and store for the visualizer.
@@ -909,6 +929,14 @@ impl AudioProcessor {
         spec: &pulse::sample::Spec,
         sink: Option<&str>,
     ) -> Result<psimple::Simple, String> {
+        let attr = pulse::def::BufferAttr {
+            maxlength: 131_072,
+            tlength: 65_536,
+            prebuf: 32_768,
+            minreq: 16_384,
+            fragsize: u32::MAX,
+        };
+
         psimple::Simple::new(
             None,
             "FXSound Output",
@@ -917,7 +945,7 @@ impl AudioProcessor {
             "Processed Audio",
             spec,
             None,
-            None,
+            Some(&attr),
         )
         .map_err(|e| format!("Failed to create output stream: {}", e))
     }
@@ -967,6 +995,14 @@ impl AudioProcessor {
         routing: OutputRouting,
         spec: pulse::sample::Spec,
     ) -> Result<(), String> {
+        let input_attr = pulse::def::BufferAttr {
+            maxlength: 131_072,
+            tlength: u32::MAX,
+            prebuf: u32::MAX,
+            minreq: u32::MAX,
+            fragsize: 16_384,
+        };
+
         // Try to open the monitor source (captures system audio output)
         let input = psimple::Simple::new(
             None,
@@ -976,7 +1012,7 @@ impl AudioProcessor {
             "Capture System Audio",
             &spec,
             None,
-            None,
+            Some(&input_attr),
         )
         .inspect_err(|e| {
             log::warn!(
@@ -997,7 +1033,7 @@ impl AudioProcessor {
                     "Capture System Audio",
                     &spec,
                     None,
-                    None,
+                    Some(&input_attr),
                 )
                 .map_err(|e| format!("Failed to create input stream: {}", e))?
             }
@@ -1012,7 +1048,10 @@ impl AudioProcessor {
         log::info!("Audio streams created successfully");
         log::info!("Processing system audio through FXSound...");
 
-        const BUFFER_SIZE: usize = 1024;
+        // 4096 interleaved samples = 2048 stereo frames = ~42.7 ms at 48 kHz.
+        // Larger blocks reduce PulseAudio syscall/IPC overhead and give the
+        // Celeron more scheduling headroom, which prevents output underruns.
+        const BUFFER_SIZE: usize = 4096;
         let mut input_bytes = vec![0u8; BUFFER_SIZE * 4]; // f32 = 4 bytes
         let mut input_samples = vec![0f32; BUFFER_SIZE];
         let mut output_samples = vec![0f32; BUFFER_SIZE];

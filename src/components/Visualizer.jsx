@@ -3,7 +3,7 @@ import { call } from "../tauri";
 
 const BAR_COUNT = 32;
 const CANVAS_HEIGHT = 120;
-const POLL_INTERVAL_MS = 50;
+const POLL_INTERVAL_MS = 100;
 
 // Canvas.roundRect is missing on WebKitGTK older than 2.40, which still ships
 // on long-support distros. Calling it there throws on every animation frame and
@@ -234,9 +234,15 @@ const Visualizer = React.memo(function Visualizer({ powered }) {
 
         init();
 
+        let lastDrawAt = 0;
         function loop(now) {
             if (cancelled) return;
-            drawFrame(now, lastTimeRef);
+            // 30 FPS is enough for a spectrum meter and is substantially cheaper
+            // on WebKitGTK than repainting on every display frame.
+            if (now - lastDrawAt >= 33) {
+                lastDrawAt = now;
+                drawFrame(now, lastTimeRef);
+            }
             animFrameRef.current = requestAnimationFrame(loop);
         }
         animFrameRef.current = requestAnimationFrame(loop);
